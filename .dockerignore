@@ -1,0 +1,11 @@
+.git
+__pycache__/
+.pytest_cache/
+artifacts/
+checkpoints/
+results/
+outputs/
+datasets/
+*.safetensors
+*.pt
+*.jsonl

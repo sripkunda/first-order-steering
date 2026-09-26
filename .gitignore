@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+
+# Models, adapters, generated text, and scored artifacts are experiment outputs.
+artifacts/
+checkpoints/
+results/
+outputs/
+datasets/
+*.safetensors
+*.pt

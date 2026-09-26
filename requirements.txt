@@ -1,0 +1,13 @@
+transformers>=5.5.0,<6.0.0
+datasets>=2.20.0
+accelerate>=0.34.0
+peft>=0.17.0
+huggingface_hub>=0.24.0
+numpy>=1.26.0
+safetensors>=0.4.0
+scikit-learn>=1.4.0
+sentencepiece>=0.2.0
+ijson>=3.3.0
+orjson>=3.10.0
+matplotlib>=3.8.0
+pytest>=8.0.0
