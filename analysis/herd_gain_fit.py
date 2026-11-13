@@ -3,8 +3,9 @@
 The independent LoRAs and the previously learned low-rank interaction
 directions remain fixed.  Four deployable subset gains (for three axes) are
 fit against a residual vector containing distributional composition,
-paired-dataset marginal behavior, exact local signal curvature, prompt-wise
-variation of the local steering field, and normalized interaction magnitude.
+paired-dataset marginal behavior, local weight-space directional curvature,
+prompt-wise variation of the weight-JVP field, and normalized interaction
+magnitude.
 
 All fitting examples come from the configured axis datasets.  A configurable
 evaluation prompt set is loaded only to exclude overlap; it is never used as
@@ -247,6 +248,32 @@ def _reverse_directional_derivatives(function, primal: torch.Tensor,
     return first.detach(), second.detach()
 
 
+def vector_directional_derivatives(output: torch.Tensor, alpha: torch.Tensor):
+    """Return vector-valued d output/d alpha and d2 output/d alpha2."""
+    cotangent = torch.zeros_like(output, requires_grad=True)
+    first_pairing = torch.autograd.grad(
+        output, alpha, grad_outputs=cotangent, create_graph=True,
+        retain_graph=True,
+    )[0]
+    first = torch.autograd.grad(
+        first_pairing, cotangent, create_graph=True, retain_graph=True,
+    )[0]
+    second_pairing = torch.autograd.grad(
+        first_pairing, alpha, create_graph=True, retain_graph=True,
+        allow_unused=True,
+    )[0]
+    if second_pairing is not None and second_pairing.requires_grad:
+        second = torch.autograd.grad(
+            second_pairing, cotangent, create_graph=False, retain_graph=True,
+            allow_unused=True,
+        )[0]
+    else:
+        second = None
+    if second is None:
+        second = torch.zeros_like(output)
+    return first.detach(), second.detach()
+
+
 class ResidualEvaluator:
     def __init__(self, model, tokenizer, baseline, interactions, device: torch.device,
                  max_prompt_tokens: int, interior_margin: float,
@@ -378,92 +405,163 @@ class ResidualEvaluator:
         return (marginal - amplitude.detach()) / scale
 
     def _curvature(self, candidates: torch.Tensor, prompts: Sequence[str], seed: int):
-        """Exact local J_s and J_s J_s residuals at random interior points.
+        """Compute the HeRD-relevant local weight derivatives.
 
-        For layer ell, every preceding layer runs at a fixed sampled signal s.
-        Only layer ell sees the differentiable signal argument.  Consequently
-        its input h_{ell-1}(x, s) has zero signal tangent, and the nested JVPs
-        are derivatives of the single decoder-block map F_ell with that input
-        held fixed.  Prompt variation of the first JVP is the directly relevant
-        condition for compressing the source field to a static residual vector.
+        For a sampled interior steering point s, each layer receives the actual
+        low-rank direction U_l(s)=sum_i s_i DeltaW_{i,l}+
+        sum_S eta_S prod_{i in S}s_i R_{S,l}.  At the base weights and with
+        that layer's incoming activation detached, reverse-over-reverse AD
+        computes D_{W_l}F_l[U_l] and D^2_{W_l}F_l[U_l,U_l].  Thus ``ss`` is
+        weight-space directional curvature relative to its first derivative;
+        ``static`` is the trace of prompt covariance of the weight-JVP field,
+        normalized by its mean squared norm.  Neither residual differentiates
+        with respect to the steering coordinates s.
         """
         M, B, K = candidates.shape[0], len(prompts), len(self.baseline.axes)
         if B < 2 and self.weights.get("static", 0) > 0:
-            raise ValueError(
-                "The static-field residual requires at least two curvature prompts"
-            )
+            raise ValueError("The prompt-variance residual requires at least two prompts")
         encoded = encode(self.tokenizer, prompts, self.device, self.max_prompt_tokens)
         generator = torch.Generator(device="cpu").manual_seed(seed)
         span = 1.0 - 2.0 * self.interior_margin
-        point = self.interior_margin + span * torch.rand((1, K), generator=generator)
-        point = point.to(self.device).expand(B, -1)
-        direction = torch.randint(0, 2, (1, K), generator=generator).float().mul_(2).sub_(1)
-        direction = (direction / math.sqrt(K)).to(self.device).expand(B, -1)
-
+        point = self.interior_margin + span * torch.rand((K,), generator=generator)
+        point = point.to(device=self.device, dtype=torch.float32)
+        point_values = [float(value) for value in point.detach().cpu().tolist()]
+        candidate_values = candidates.detach().cpu().tolist()
         ids = _repeat_rows(encoded["input_ids"], M)
         mask = _repeat_rows(encoded["attention_mask"], M)
-        signals = _repeat_rows(point, M)
-        tangent = _repeat_rows(direction, M)
-        gains = candidates.repeat_interleave(B, 0)
-        all_keys = set(self.baseline.keys)
-        ss_values, static_values = [], []
-        for layer_index in self.curvature_layers:
-            local_keys = self.layer_keys[layer_index]
-            fixed_keys = sorted(all_keys - set(local_keys))
+        positions = torch.arange(mask.shape[1], device=self.device)
+        last = (positions.unsqueeze(0) * mask.long()).amax(1)
+        alpha = [
+            [torch.zeros((), device=self.device, dtype=torch.float32, requires_grad=True)
+             for _ in self.layers]
+            for _ in range(M)
+        ]
+        fields: dict[int, list[torch.Tensor]] = {}
+        curvatures: dict[int, list[torch.Tensor]] = {}
+        linear_handles, layer_handles = [], []
 
-            def layer_output(local_signal: torch.Tensor) -> torch.Tensor:
-                captured = {}
+        def make_projection_hook(key: str, layer_index: int):
+            axis_factors = [
+                self.baseline.prepared_factor(axis, key, self.device,
+                                              self.model._adapted_linears[key].linear.weight.dtype)
+                if key in self.baseline.factors[axis] else None
+                for axis in self.baseline.axes
+            ]
+            interaction_factors = [
+                (subset, self.interactions.branch(subset, key))
+                for subset in self.interactions.subsets
+            ]
 
-                def stop_layer_gradient(_module, _inputs, output):
-                    value = output[0] if isinstance(output, tuple) else output
-                    captured["value"] = value
-                    # Later layers are irrelevant to this local derivative.
-                    # Detaching the value passed onward prevents constructing
-                    # a needless suffix graph while preserving normal forward
-                    # execution and architecture-specific bookkeeping.
-                    detached = value.detach()
-                    return ((detached, *output[1:])
-                            if isinstance(output, tuple) else detached)
-
-                capture_handle = self.layers[layer_index].register_forward_hook(
-                    stop_layer_gradient,
-                )
-                self.model._ctx["active"] = False
-                try:
-                    with IndependentLoRAHooks(
-                        self.model, self.baseline, signals, keys=fixed_keys,
-                    ), MultiAffineInteractionHooks(
-                        self.model, self.interactions, signals,
-                        subset_gains=gains, keys=fixed_keys,
-                    ), IndependentLoRAHooks(
-                        self.model, self.baseline, local_signal, keys=local_keys,
-                    ), MultiAffineInteractionHooks(
-                        self.model, self.interactions, local_signal,
-                        subset_gains=gains, keys=local_keys,
-                    ):
-                        self.model.llama(
-                            input_ids=ids, attention_mask=mask,
-                            output_hidden_states=False, use_cache=False,
+            def add(_module, inputs, output):
+                x = inputs[0]
+                chunks = []
+                for candidate_index in range(M):
+                    start, stop = candidate_index * B, (candidate_index + 1) * B
+                    local_x = x[start:stop]
+                    local_output = output[start:stop]
+                    correction = torch.zeros_like(local_output)
+                    for axis_index, factor in enumerate(axis_factors):
+                        if factor is None:
+                            continue
+                        reduced = F.linear(local_x, factor.A.to(local_x.dtype))
+                        correction = correction + (
+                            factor.scale * point_values[axis_index]
+                            * F.linear(reduced, factor.B.to(local_x.dtype))
                         )
-                finally:
-                    capture_handle.remove()
-                if "value" not in captured:
-                    raise RuntimeError(f"Failed to capture decoder layer {layer_index}")
-                return captured["value"][:, -1]
+                    for subset_index, (subset, branch) in enumerate(interaction_factors):
+                        gate = math.prod(point_values[index] for index in subset)
+                        if gate == 0.0:
+                            continue
+                        reduced = F.linear(local_x, branch.A.to(local_x.dtype))
+                        correction = correction + (
+                            self.interactions.scale * candidate_values[candidate_index][subset_index]
+                            * gate * F.linear(reduced, branch.B.to(local_x.dtype))
+                        )
+                    chunks.append(local_output + alpha[candidate_index][layer_index] * correction)
+                return torch.cat(chunks, dim=0)
+            return add
 
+        def detach_layer_input(_module, args, kwargs):
+            if args:
+                return (args[0].detach(), *args[1:]), kwargs
+            if "hidden_states" in kwargs:
+                changed = dict(kwargs)
+                changed["hidden_states"] = changed["hidden_states"].detach()
+                return args, changed
+            raise RuntimeError("Decoder block did not receive hidden states")
+
+        def make_layer_hook(layer_index: int):
+            def evaluate(_module, _args, _kwargs, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                selected = hidden.gather(
+                    1, last.reshape(-1, 1, 1).expand(-1, 1, hidden.shape[-1]),
+                ).squeeze(1)
+                layer_fields, layer_curvatures = [], []
+                for candidate_index in range(M):
+                    start, stop = candidate_index * B, (candidate_index + 1) * B
+                    first, second = vector_directional_derivatives(
+                        selected[start:stop], alpha[candidate_index][layer_index],
+                    )
+                    layer_fields.append(first.float())
+                    layer_curvatures.append(second.float().norm(dim=-1))
+                fields[layer_index] = torch.stack(layer_fields).detach().cpu()
+                curvatures[layer_index] = torch.stack(layer_curvatures).detach().cpu()
+                detached = hidden.detach()
+                return (detached, *output[1:]) if isinstance(output, tuple) else detached
+            return evaluate
+
+        # The model wrapper contains projections for every layer, but an
+        # independent adapter/artifact may only contain a strict subset. Only
+        # attach hooks to actual adapter projections in requested layers.
+        for layer_index in self.curvature_layers:
+            for key in self.layer_keys[layer_index]:
+                module = self.model._adapted_linears[key]
+                linear_handles.append(module.register_forward_hook(
+                    make_projection_hook(key, layer_index),
+                ))
+        for layer_index in self.curvature_layers:
+            layer = self.layers[layer_index]
+            layer_handles.append(layer.register_forward_pre_hook(
+                detach_layer_input, with_kwargs=True,
+            ))
+            layer_handles.append(layer.register_forward_hook(
+                make_layer_hook(layer_index), with_kwargs=True,
+            ))
+        try:
+            self.model._ctx["active"] = False
             with torch.enable_grad():
-                first, second = _reverse_directional_derivatives(
-                    layer_output, signals, tangent,
+                self.model.llama(
+                    input_ids=ids, attention_mask=mask, use_cache=False,
                 )
-            first = first.float().reshape(M, B, -1)
-            second = second.float().reshape(M, B, -1)
-            first_norm = first.norm(dim=-1).clamp_min(1e-6)
-            ss_values.append(second.norm(dim=-1) / first_norm)
+        finally:
+            for handle in linear_handles + layer_handles:
+                handle.remove()
 
-            mean = first.mean(dim=1, keepdim=True)
-            rms = first.square().sum(dim=-1).mean(dim=1).sqrt().clamp_min(1e-6)
-            static_values.append((first - mean).norm(dim=-1) / rms.unsqueeze(1))
-        return torch.stack(ss_values, 1), torch.stack(static_values, 1)
+        layer_ids = sorted(fields)
+        if layer_ids != self.curvature_layers:
+            raise RuntimeError(
+                f"Captured local weight derivatives at {layer_ids}; "
+                f"expected {self.curvature_layers}"
+            )
+        ss_values, static_values = [], []
+        for layer_index in layer_ids:
+            first = fields[layer_index].double()  # [candidate, prompt, hidden]
+            second_norm = curvatures[layer_index].double()
+            first_norm = first.norm(dim=-1).clamp_min(1e-12)
+            if self.weights.get("ss", 0) > 0:
+                ss_values.append(second_norm / first_norm)
+            if self.weights.get("static", 0) > 0:
+                centered = first - first.mean(dim=1, keepdim=True)
+                variance_trace = centered.square().sum(-1).mean(-1)
+                field_energy = first.square().sum(-1).mean(-1).clamp_min(1e-20)
+                static_values.append(variance_trace / field_energy)
+        ss = (torch.cat(ss_values, dim=1) if ss_values
+              else torch.empty(M, 0, device=candidates.device))
+        static = (torch.stack(static_values, dim=1) if static_values
+                  else torch.empty(M, 0, device=candidates.device))
+        ss = ss.to(device=candidates.device, dtype=candidates.dtype)
+        static = static.to(device=candidates.device, dtype=candidates.dtype)
+        return ss, static
 
     def __call__(self, candidates: torch.Tensor, teacher_batch: TeacherBatch,
                  pair_batch: dict, curvature_prompts: Sequence[str], seed: int):
@@ -655,13 +753,13 @@ def parse_args():
     parser.add_argument(
         "--curvature_layers", type=_layer_indices,
         help=("Zero-indexed comma-separated decoder layers used by both exact local "
-              "signal-curvature and prompt-variation residuals. Defaults to all layers."),
+              "weight-curvature and prompt-variance residuals. Defaults to all layers."),
     )
     parser.add_argument("--kl_weight", type=float, default=1.0)
-    parser.add_argument("--marginal_weight", type=float, default=1.0)
+    parser.add_argument("--marginal_weight", type=float, default=0.0)
     parser.add_argument("--ss_weight", type=float, default=0.1)
     parser.add_argument("--static_weight", type=float,
-                        help="Weight on prompt variation of the exact local steering JVP.")
+                        help="Weight on prompt variation of the local weight-direction JVP.")
     parser.add_argument("--xs_weight", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--interaction_norm_weight", type=float, default=0.05)
     parser.add_argument(
@@ -729,6 +827,8 @@ def main():
     baseline = load_independent_loras(root, axes)
     interactions = MultiAffineInteractions.load_artifact(source, baseline)
     interactions.subset_gains.fill_(1.0)
+    for parameter in interactions.parameters():
+        parameter.requires_grad_(False)
     datasets = _infer_axis_datasets(root, axes, args.axis_dataset)
     device = torch.device(args.device)
     set_seed(args.seed)
@@ -777,7 +877,7 @@ def main():
     weights = residual_weights
     requested_curvature_layers = args.curvature_layers
     LOG.info(
-        "Active residuals: %s; curvature layers: %s",
+        "Active residuals: %s; local weight-derivative layers: %s",
         [name for name, weight in weights.items() if weight > 0],
         requested_curvature_layers if requested_curvature_layers is not None else "all",
     )
@@ -885,9 +985,10 @@ def main():
             "kl_improvement_retention": args.kl_improvement_retention,
             "heldout_kl_limit": kl_limit,
             "interior_margin": args.interior_margin,
-            "signal_derivative_method": "exact_reverse_over_reverse_directional_autodiff",
-            "signal_derivative_scope": "single_decoder_layer_with_fixed_input",
-            "static_residual": "normalized_prompt_variance_of_local_signal_jvp",
+            "local_weight_derivative_method": "exact_reverse_over_reverse_directional_autodiff",
+            "local_weight_derivative_scope": "D_W_l F_l at base weights with incoming base activation fixed",
+            "ss_residual": "D2_W_l_F_l[U_l,U_l]_norm_over_D_W_l_F_l[U_l]_norm",
+            "static_residual": "trace_prompt_covariance_of_D_W_l_F_l[U_l]_over_mean_squared_norm",
             "curvature_layers": evaluator.curvature_layers,
             "active_residuals": [name for name, weight in weights.items() if weight > 0],
             "weights": weights,

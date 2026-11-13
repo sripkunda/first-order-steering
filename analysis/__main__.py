@@ -10,6 +10,9 @@ COMMANDS = {
     "fit-gains": "analysis.herd_gain_fit",
     "generate": "analysis.compositional_generation",
     "compare-steering": "analysis.independent_steering_comparison",
+    "compare-supervised": "analysis.supervised_baselines.run",
+    "compare-caa": "analysis.supervised_baselines.contrastive_caa",
+    "merge-scores": "analysis.merge_behavior_classifier_scores",
     "train-classifier": "analysis.behavior_classifier",
     "report": "analysis.behavior_classifier_paper_report",
 }

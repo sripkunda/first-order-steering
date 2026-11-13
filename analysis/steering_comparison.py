@@ -24,7 +24,7 @@ from .steering_baselines import (ActivationController, MultiAxisControllerHooks,
 
 LOG = logging.getLogger(__name__)
 
-CLASSICAL_METHODS = ("caa", "repe", "mimic", "re_control", "linear_act", "odesteer")
+CLASSICAL_METHODS = ("adapter_caa", "repe", "mimic", "re_control", "linear_act", "odesteer")
 OUR_METHODS = ("ours_static", "ours_autoregressive_jacobian")
 ALL_METHODS = CLASSICAL_METHODS + OUR_METHODS
 
@@ -190,7 +190,7 @@ def _odesteer_contrastive_activations(
 def _controller_fit(method: str, positive: torch.Tensor, negative: torch.Tensor,
                     method_kwargs: Mapping) -> tuple[ActivationController, dict]:
     start = time.perf_counter()
-    if method == "caa":
+    if method == "adapter_caa":
         controller, details = fit_caa(positive, negative), {}
     elif method == "repe":
         controller = fit_repe(positive, negative)
@@ -810,7 +810,7 @@ def steering_method_comparison(
             "held_out_generation_prompts": len(generation_prompts),
         },
         "method_definitions": {
-            "caa": "Per-axis residual mean difference; independent endpoint fields compose additively.",
+            "adapter_caa": "Per-axis residual mean difference between the base model and independently LoRA-adapted model; endpoint fields compose additively.",
             "repe": "Per-axis PC1 of paired independent endpoint differences, oriented and scaled by the training mean displacement.",
             "mimic": "Per-axis affine Gaussian optimal-transport map gated to activations classified as negative; maps compose additively.",
             "re_control": "Per-axis value MLP fitted to independent endpoint labels; its activation gradient is recomputed at every autoregressive forward.",

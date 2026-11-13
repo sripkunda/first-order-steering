@@ -12,3 +12,4 @@ outputs/
 datasets/
 *.safetensors
 *.pt
+scripts
